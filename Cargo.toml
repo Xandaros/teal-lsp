@@ -1,0 +1,17 @@
+[package]
+name = "teal-lsp"
+version = "0.1.0"
+authors = ["Martin Zeller <mz.bremerhaven@gmail.com>"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+tower-lsp = "^0.14.1"
+tree-sitter-teal = {version = "^0.0.1", path = "/home/xandaros/workspace/tree-sitter-teal"}
+log = "^0.4.14"
+serde_json = "^1.0.64"
+tokio = {version = "^1.3.0", features = ["full"]}
+tree-sitter = "0.19.3"
+once_cell = "1.7.2"
+async-recursion = "0.3.2"
