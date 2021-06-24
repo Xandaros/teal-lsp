@@ -2,7 +2,7 @@ use log::{error, warn};
 use once_cell::sync::Lazy;
 use serde_json::Value;
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::RwLock;
 use tower_lsp::{
     jsonrpc::Result as TResult, lsp_types::*, Client, LanguageServer, LspService, Server,
 };
@@ -17,8 +17,8 @@ fn get_parser() -> tree_sitter::Parser {
 
 struct Backend {
     _client: Client,
-    document: Arc<Mutex<Option<tree_sitter::Tree>>>,
-    source: Arc<Mutex<String>>,
+    document: Arc<RwLock<Option<tree_sitter::Tree>>>,
+    source: Arc<RwLock<String>>,
 }
 
 fn pretty_print(source: &str, node: tree_sitter::Node, indent: usize) -> String {
@@ -149,22 +149,16 @@ impl LanguageServer for Backend {
     }
 
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
-        let mut source = self.source.lock().await;
+        let mut source = self.source.write().await;
         *source = params.text_document.text;
         let mut parser = get_parser();
-        let mut document = self.document.lock().await;
+        let mut document = self.document.write().await;
         *document = parser.parse(source.clone(), None);
-        let mut cursor = match *document {
-            Some(ref doc) => doc.walk(),
-            None => unreachable!(),
-        };
-        println!("{}", pretty_print(&source, cursor.node(), 0));
-        cursor.goto_first_child();
-        cursor.goto_first_child();
-        cursor.goto_next_sibling();
-        cursor.goto_next_sibling();
-        let asd = cursor.node().utf8_text(source.as_bytes()).unwrap();
-        println!("{:?}", asd);
+        // let mut cursor = match *document {
+        //     Some(ref doc) => doc.walk(),
+        //     None => unreachable!(),
+        // };
+        // println!("{}", pretty_print(&source, cursor.node(), 0));
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
@@ -473,9 +467,9 @@ async fn main() -> Result<(), std::io::Error> {
     let (read, write) = tokio::io::split(stream);
 
     let (service, messages) = LspService::new(|client| Backend {
-        client,
-        document: Arc::new(Mutex::new(None)),
-        source: Arc::new(Mutex::new(String::new())),
+        _client: client,
+        document: Arc::new(RwLock::new(None)),
+        source: Arc::new(RwLock::new(String::new())),
     });
 
     Server::new(read, write)
