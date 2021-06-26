@@ -6,6 +6,7 @@ use tokio::sync::RwLock;
 use tower_lsp::{
     jsonrpc::Result as TResult, lsp_types::*, Client, LanguageServer, LspService, Server,
 };
+use tree_sitter::InputEdit;
 
 fn get_parser() -> tree_sitter::Parser {
     let mut parser = tree_sitter::Parser::new();
@@ -150,11 +151,11 @@ impl LanguageServer for Backend {
         Ok(result)
     }
 
+    async fn initialized(&self, _params: InitializedParams) {}
+
     async fn shutdown(&self) -> TResult<()> {
         Ok(())
     }
-
-    async fn initialized(&self, _params: InitializedParams) {}
 
     async fn did_change_workspace_folders(&self, params: DidChangeWorkspaceFoldersParams) {
         let _ = params;
@@ -221,6 +222,7 @@ impl LanguageServer for Backend {
 
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
         let url = params.text_document.uri;
+
         {
             let mut documents = self.documents.write().await;
 
@@ -242,17 +244,85 @@ impl LanguageServer for Backend {
             }
         }
 
-        // let mut cursor = match *document {
-        //     Some(ref doc) => doc.walk(),
-        //     None => unreachable!(),
-        // };
-        // println!("{}", pretty_print(&source, cursor.node(), 0));
         self.report_syntax_errors().await;
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
-        let _ = params;
-        warn!("Got a textDocument/didChange notification, but it is not implemented");
+        fn get_last_line_col(s: &str) -> tree_sitter::Point {
+            let (count, last) = {
+                let it = s.lines();
+                let mut last = "";
+                let mut count = 0;
+                for line in it {
+                    count += 1;
+                    last = line;
+                }
+                (count, last)
+            };
+            tree_sitter::Point {
+                column: last.chars().count() - 1,
+                row: count - 1,
+            }
+        }
+        let url = params.text_document.uri;
+
+        {
+            let mut documents = self.documents.write().await;
+            let document = if let Some(document) = documents.get_mut(&url) {
+                document
+            } else {
+                println!("Got change for document we are not tracking...");
+                return;
+            };
+            let mut source = document.source.clone();
+
+            for change in params.content_changes {
+                let edit = if let Some(range) = change.range {
+                    // InputEdit {
+                    //     start_byte: todo!(),
+                    //     old_end_byte: todo!(),
+                    //     new_end_byte: todo!(),
+                    //     start_position: tree_sitter::Point {
+                    //         row: range.start.line as usize,
+                    //         column: range.start.character as usize,
+                    //     },
+                    //     old_end_position: tree_sitter::Point {
+                    //         row: range.end.line as usize,
+                    //         column: range.end.character as usize,
+                    //     },
+                    //     new_end_position: todo!(),
+                    // };
+                    println!("Edit range not None");
+                    InputEdit {
+                        start_byte: 0,
+                        old_end_byte: 0,
+                        new_end_byte: 0,
+                        start_position: tree_sitter::Point { row: 0, column: 0 },
+                        old_end_position: tree_sitter::Point { row: 0, column: 0 },
+                        new_end_position: tree_sitter::Point { row: 0, column: 0 },
+                    }
+                } else {
+                    let edit = InputEdit {
+                        start_byte: 0,
+                        old_end_byte: source.len(),
+                        new_end_byte: change.text.len(),
+                        start_position: tree_sitter::Point { row: 0, column: 0 },
+                        old_end_position: get_last_line_col(&source),
+                        new_end_position: get_last_line_col(&change.text),
+                    };
+                    source = change.text;
+                    edit
+                };
+
+                document.tree.edit(&edit);
+            }
+            let mut parser = get_parser();
+            if let Some(tree) = parser.parse(source, Some(&document.tree)) {
+                document.tree = tree;
+            }
+        }
+
+        self.report_syntax_errors().await;
     }
 
     async fn will_save(&self, params: WillSaveTextDocumentParams) {
