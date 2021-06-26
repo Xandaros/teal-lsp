@@ -19,9 +19,10 @@ struct Backend {
     _client: Client,
     document: Arc<RwLock<Option<tree_sitter::Tree>>>,
     source: Arc<RwLock<String>>,
+    url: Arc<RwLock<Option<Url>>>,
 }
 
-fn pretty_print(source: &str, node: tree_sitter::Node, indent: usize) -> String {
+fn _pretty_print(source: &str, node: tree_sitter::Node, indent: usize) -> String {
     static PRINT_KINDS: Lazy<[u16; 2]> = Lazy::new(|| {
         let language = tree_sitter_teal::language();
         [
@@ -31,6 +32,11 @@ fn pretty_print(source: &str, node: tree_sitter::Node, indent: usize) -> String 
     });
     let mut ret = String::new();
 
+    if node.is_error() {
+        ret.push_str("ERROR: ");
+    } else if node.is_missing() {
+        ret.push_str("MISSING: ");
+    }
     ret.push_str(&"\t".repeat(indent));
     if PRINT_KINDS.contains(&node.kind_id()) {
         ret.push_str("\"");
@@ -43,10 +49,72 @@ fn pretty_print(source: &str, node: tree_sitter::Node, indent: usize) -> String 
 
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
-        ret.push_str(&pretty_print(source, child, indent + 1));
+        ret.push_str(&_pretty_print(source, child, indent + 1));
     }
 
     ret
+}
+
+impl Backend {
+    fn collect_syntax_errors(&self, node: tree_sitter::Node, diagnostics: &mut Vec<Diagnostic>) {
+        println!("Syntax check: {:?} ({})", node, node.has_error());
+        let mut cursor = node.walk();
+        let has_children = cursor.goto_first_child();
+        let mut last_error = true;
+
+        if has_children {
+            loop {
+                if cursor.node().has_error() {
+                    last_error = false;
+                    self.collect_syntax_errors(cursor.node(), diagnostics);
+                }
+
+                if !cursor.goto_next_sibling() {
+                    break;
+                }
+            }
+        }
+
+        if node.is_error() || last_error {
+            diagnostics.push(Diagnostic {
+                range: Range {
+                    start: Position {
+                        line: node.range().start_point.row as u32,
+                        character: node.range().start_point.column as u32,
+                    },
+                    end: Position {
+                        line: node.range().end_point.row as u32,
+                        character: node.range().end_point.column as u32,
+                    },
+                },
+                severity: Some(DiagnosticSeverity::Error),
+                code: None,
+                code_description: None,
+                source: None,
+                message: "Syntax error".to_string(),
+                related_information: None,
+                tags: None,
+                data: None,
+            });
+        }
+    }
+
+    async fn report_syntax_errors(&self) {
+        let tree = self.document.read().await.clone().unwrap();
+        let mut diagnostics = Vec::new();
+        {
+            let node = tree.root_node();
+            if !node.has_error() {
+                return;
+            }
+            self.collect_syntax_errors(tree.root_node(), &mut diagnostics);
+        }
+        println!("{:?}", diagnostics);
+        let uri = self.url.read().await.clone();
+        self._client
+            .publish_diagnostics(uri.unwrap(), diagnostics, None)
+            .await;
+    }
 }
 
 #[tower_lsp::async_trait]
@@ -149,16 +217,28 @@ impl LanguageServer for Backend {
     }
 
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
+        {
+            let mut url = self.url.write().await;
+            *url = Some(params.text_document.uri.clone());
+        }
         let mut source = self.source.write().await;
         *source = params.text_document.text;
+        let source = {
+            let s = source.clone();
+            drop(source);
+            s
+        };
         let mut parser = get_parser();
         let mut document = self.document.write().await;
         *document = parser.parse(source.clone(), None);
+        drop(document);
+
         // let mut cursor = match *document {
         //     Some(ref doc) => doc.walk(),
         //     None => unreachable!(),
         // };
         // println!("{}", pretty_print(&source, cursor.node(), 0));
+        self.report_syntax_errors().await;
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
@@ -462,19 +542,21 @@ impl LanguageServer for Backend {
 async fn main() -> Result<(), std::io::Error> {
     // let stdin = tokio::io::stdin();
     // let stdout = tokio::io::stdout();
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:9527").await?;
-    let (stream, _) = listener.accept().await?;
-    let (read, write) = tokio::io::split(stream);
+    loop {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:9527").await?;
+        let (stream, _) = listener.accept().await?;
+        let (read, write) = tokio::io::split(stream);
 
-    let (service, messages) = LspService::new(|client| Backend {
-        _client: client,
-        document: Arc::new(RwLock::new(None)),
-        source: Arc::new(RwLock::new(String::new())),
-    });
+        let (service, messages) = LspService::new(|client| Backend {
+            _client: client,
+            document: Arc::new(RwLock::new(None)),
+            source: Arc::new(RwLock::new(String::new())),
+            url: Arc::new(RwLock::new(None)),
+        });
 
-    Server::new(read, write)
-        .interleave(messages)
-        .serve(service)
-        .await;
-    Ok(())
+        Server::new(read, write)
+            .interleave(messages)
+            .serve(service)
+            .await;
+    }
 }
