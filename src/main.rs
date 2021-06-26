@@ -1,7 +1,7 @@
 use log::{error, warn};
 use once_cell::sync::Lazy;
 use serde_json::Value;
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 use tokio::sync::RwLock;
 use tower_lsp::{
     jsonrpc::Result as TResult, lsp_types::*, Client, LanguageServer, LspService, Server,
@@ -15,11 +15,14 @@ fn get_parser() -> tree_sitter::Parser {
     parser
 }
 
+struct Document {
+    tree: tree_sitter::Tree,
+    source: String,
+}
+
 struct Backend {
     _client: Client,
-    document: Arc<RwLock<Option<tree_sitter::Tree>>>,
-    source: Arc<RwLock<String>>,
-    url: Arc<RwLock<Option<Url>>>,
+    documents: Arc<RwLock<HashMap<Url, Document>>>,
 }
 
 fn _pretty_print(source: &str, node: tree_sitter::Node, indent: usize) -> String {
@@ -100,20 +103,20 @@ impl Backend {
     }
 
     async fn report_syntax_errors(&self) {
-        let tree = self.document.read().await.clone().unwrap();
-        let mut diagnostics = Vec::new();
-        {
-            let node = tree.root_node();
-            if !node.has_error() {
-                return;
+        let documents = self.documents.read().await;
+        for (url, document) in documents.iter() {
+            let mut diagnostics = Vec::new();
+            {
+                let node = document.tree.root_node();
+                if node.has_error() {
+                    self.collect_syntax_errors(document.tree.root_node(), &mut diagnostics);
+                }
             }
-            self.collect_syntax_errors(tree.root_node(), &mut diagnostics);
+            println!("{:?}", diagnostics);
+            self._client
+                .publish_diagnostics(url.clone(), diagnostics, None)
+                .await;
         }
-        println!("{:?}", diagnostics);
-        let uri = self.url.read().await.clone();
-        self._client
-            .publish_diagnostics(uri.unwrap(), diagnostics, None)
-            .await;
     }
 }
 
@@ -217,21 +220,27 @@ impl LanguageServer for Backend {
     }
 
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
+        let url = params.text_document.uri;
         {
-            let mut url = self.url.write().await;
-            *url = Some(params.text_document.uri.clone());
+            let mut documents = self.documents.write().await;
+
+            let mut parser = get_parser();
+            if let Some(tree) = parser.parse(params.text_document.text.clone(), None) {
+                match documents.get_mut(&url) {
+                    Some(mut document) => {
+                        document.tree = tree;
+                        document.source = params.text_document.text;
+                    }
+                    None => {
+                        let document = Document {
+                            tree,
+                            source: params.text_document.text,
+                        };
+                        documents.insert(url, document);
+                    }
+                }
+            }
         }
-        let mut source = self.source.write().await;
-        *source = params.text_document.text;
-        let source = {
-            let s = source.clone();
-            drop(source);
-            s
-        };
-        let mut parser = get_parser();
-        let mut document = self.document.write().await;
-        *document = parser.parse(source.clone(), None);
-        drop(document);
 
         // let mut cursor = match *document {
         //     Some(ref doc) => doc.walk(),
@@ -242,7 +251,6 @@ impl LanguageServer for Backend {
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
-        println!("Did change: {:?}", params);
         let _ = params;
         warn!("Got a textDocument/didChange notification, but it is not implemented");
     }
@@ -549,9 +557,7 @@ async fn main() -> Result<(), std::io::Error> {
 
         let (service, messages) = LspService::new(|client| Backend {
             _client: client,
-            document: Arc::new(RwLock::new(None)),
-            source: Arc::new(RwLock::new(String::new())),
-            url: Arc::new(RwLock::new(None)),
+            documents: Arc::new(RwLock::new(HashMap::new())),
         });
 
         Server::new(read, write)
