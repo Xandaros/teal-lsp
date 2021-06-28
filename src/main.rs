@@ -249,7 +249,7 @@ impl LanguageServer for Backend {
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
         fn get_last_line_col(s: &str) -> tree_sitter::Point {
-            let (count, last) = {
+            let (count, last): (usize, _) = {
                 let it = s.lines();
                 let mut last = "";
                 let mut count = 0;
@@ -260,8 +260,8 @@ impl LanguageServer for Backend {
                 (count, last)
             };
             tree_sitter::Point {
-                column: last.chars().count() - 1,
-                row: count - 1,
+                column: last.chars().count().saturating_sub(1),
+                row: count.saturating_sub(1),
             }
         }
         let url = params.text_document.uri;
