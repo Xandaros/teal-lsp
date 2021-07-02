@@ -8,6 +8,8 @@ use tower_lsp::{
 };
 use tree_sitter::InputEdit;
 
+mod typing;
+
 fn get_parser() -> tree_sitter::Parser {
     let mut parser = tree_sitter::Parser::new();
     parser
@@ -17,6 +19,7 @@ fn get_parser() -> tree_sitter::Parser {
 }
 
 struct Document {
+    url: Url,
     tree: tree_sitter::Tree,
     source: String,
 }
@@ -223,25 +226,16 @@ impl LanguageServer for Backend {
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
         let url = params.text_document.uri;
 
-        {
+        let mut parser = get_parser();
+        if let Some(tree) = parser.parse(params.text_document.text.clone(), None) {
+            let document = Document {
+                url: url.clone(),
+                tree,
+                source: params.text_document.text,
+            };
+            document.check_types();
             let mut documents = self.documents.write().await;
-
-            let mut parser = get_parser();
-            if let Some(tree) = parser.parse(params.text_document.text.clone(), None) {
-                match documents.get_mut(&url) {
-                    Some(mut document) => {
-                        document.tree = tree;
-                        document.source = params.text_document.text;
-                    }
-                    None => {
-                        let document = Document {
-                            tree,
-                            source: params.text_document.text,
-                        };
-                        documents.insert(url, document);
-                    }
-                }
-            }
+            documents.insert(url, document);
         }
 
         self.report_syntax_errors().await;
