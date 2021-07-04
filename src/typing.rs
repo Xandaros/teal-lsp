@@ -1,11 +1,45 @@
 use std::{cell::RefCell, collections::HashMap, convert::TryFrom, rc::Rc};
 
 use anyhow::{Error, Result};
-use once_cell::sync::Lazy;
+use once_cell::{sync::Lazy, unsync::OnceCell};
 use tower_lsp::lsp_types::Diagnostic;
 use tree_sitter::{Language, Node, Query, TreeCursor};
 
 use crate::Document;
+
+macro_rules! node_kind {
+    ($decl:ident, $name:literal) => {
+        static $decl: Lazy<u16> = Lazy::new(|| LANGUAGE.id_for_node_kind($name, true));
+    };
+}
+
+macro_rules! field_kind {
+    ($decl:ident, $name:literal) => {
+        static $decl: Lazy<u16> = Lazy::new(|| LANGUAGE.field_id_for_name($name).unwrap());
+    };
+}
+
+static LANGUAGE: Lazy<Language> = Lazy::new(|| tree_sitter_teal::language());
+node_kind!(PROGRAM, "program");
+node_kind!(RECORD_DECLARATION, "record_declaration");
+node_kind!(IDENTIFIER, "identifier");
+node_kind!(TYPEARGS, "typeargs");
+node_kind!(RECORD_BODY, "record_body");
+node_kind!(RECORD_ARRAY_TYPE, "record_array_type");
+node_kind!(RECORD_ENTRY, "record_entry");
+node_kind!(SIMPLE_TYPE, "simple_type");
+node_kind!(TYPE_INDEX, "type_index");
+node_kind!(TABLE_TYPE, "table_type");
+node_kind!(FUNCTION_TYPE, "function_type");
+node_kind!(ARG, "arg");
+node_kind!(VARARGS, "varargs");
+field_kind!(KEY, "key");
+field_kind!(STRING_KEY, "string_key");
+field_kind!(CONTENT, "content");
+field_kind!(TYPE, "type");
+field_kind!(NAME, "name");
+field_kind!(ARGUMENTS, "arguments");
+field_kind!(RETURN_TYPE, "return_type");
 
 trait Parsable: Sized {
     fn parse(
@@ -15,13 +49,20 @@ trait Parsable: Sized {
     ) -> Result<Self>;
 }
 
+#[derive(Debug, Clone)]
+struct FunctionType {
+    arguments: Vec<Type>,
+    varargs: Option<Box<Type>>,
+    return_types: Vec<Type>,
+}
+
 #[derive(Clone, Debug)]
 enum Type {
     Basic(BasicType),
     Array(BasicType),
     Tuple(Vec<BasicType>),
     Map(Box<Type>, Box<Type>),
-    Function(Vec<BasicType>, Vec<BasicType>),
+    Function(FunctionType),
     UserDefined(usize),
     Unresolved(String),
 }
@@ -94,26 +135,12 @@ struct Scope {
     parent: Option<Rc<Scope>>,
 }
 
-macro_rules! node_kind {
-    ($decl:ident, $name:literal) => {
-        static $decl: Lazy<u16> = Lazy::new(|| LANGUAGE.id_for_node_kind($name, true));
-    };
-}
-
 impl Parsable for RecordField {
     fn parse(
         document: &Document,
         cursor: &mut TreeCursor,
         types: &Vec<Declaration>,
     ) -> Result<Self> {
-        static LANGUAGE: Lazy<Language> = Lazy::new(|| tree_sitter_teal::language());
-        static KEY: Lazy<u16> = Lazy::new(|| LANGUAGE.field_id_for_name("key").unwrap());
-        static STRING_KEY: Lazy<u16> =
-            Lazy::new(|| LANGUAGE.field_id_for_name("string_key").unwrap());
-        static CONTENT: Lazy<u16> = Lazy::new(|| LANGUAGE.field_id_for_name("content").unwrap());
-        static TYPE: Lazy<u16> = Lazy::new(|| LANGUAGE.field_id_for_name("type").unwrap());
-        node_kind!(IDENTIFIER, "identifier");
-
         let node = cursor.node();
         let key = node
             .child_by_field_id(*KEY)
@@ -154,14 +181,6 @@ impl Parsable for RecordDeclaration {
         cursor: &mut TreeCursor,
         types: &Vec<Declaration>,
     ) -> Result<Self> {
-        static LANGUAGE: Lazy<Language> = Lazy::new(|| tree_sitter_teal::language());
-        static NAME: Lazy<u16> = Lazy::new(|| LANGUAGE.field_id_for_name("name").unwrap());
-        node_kind!(TYPEARGS, "typeargs");
-        node_kind!(RECORD_BODY, "record_body");
-        node_kind!(RECORD_ARRAY_TYPE, "record_array_type");
-        node_kind!(RECORD_ENTRY, "record_entry");
-        node_kind!(IDENTIFIER, "identifier");
-
         let node = cursor.node();
         let name = node
             .child_by_field_id(*NAME)
@@ -265,15 +284,83 @@ impl Parsable for Type {
         println!("Parsing type: {:?}", cursor.node().to_sexp());
 
         let node = cursor.node();
-        let text = node.utf8_text(document.source.as_bytes())?;
 
-        println!("Got text: {}", text);
+        if node.kind_id() == *SIMPLE_TYPE {
+            let text = node.utf8_text(document.source.as_bytes())?;
 
-        if let Ok(typ) = BasicType::try_from(text) {
-            return Ok(Type::Basic(typ));
+            if let Ok(typ) = BasicType::try_from(text) {
+                Ok(Type::Basic(typ))
+            } else {
+                todo!()
+            }
+        } else if node.kind_id() == *TYPE_INDEX {
+            todo!();
+        } else if node.kind_id() == *TABLE_TYPE {
+            cursor.goto_first_child();
+
+            let key_type = Type::parse(document, cursor, types)?;
+            cursor.goto_next_sibling();
+            let value_type = Type::parse(document, cursor, types)?;
+
+            cursor.goto_parent();
+            Ok(Type::Map(Box::new(key_type), Box::new(value_type)))
+        } else if node.kind_id() == *FUNCTION_TYPE {
+            // Parse arguments
+            let arguments = node.child_by_field_id(*ARGUMENTS).unwrap();
+
+            let mut arg_list = Vec::with_capacity(arguments.named_child_count());
+            let mut varargs = None;
+            let mut type_cursor: Option<TreeCursor> = None;
+            for argument in arguments.named_children(&mut node.walk()) {
+                let typ = argument.child_by_field_id(*TYPE).unwrap();
+                let mut type_cursor = if let Some(ref mut cursor) = type_cursor {
+                    cursor.reset(typ);
+                    cursor
+                } else {
+                    type_cursor = Some(typ.walk());
+                    type_cursor.as_mut().unwrap()
+                };
+
+                if let Ok(typ) = Type::parse(document, &mut type_cursor, types) {
+                    if argument.kind_id() == *ARG {
+                        arg_list.push(typ);
+                    } else if argument.kind_id() == *VARARGS {
+                        varargs = Some(Box::new(typ));
+                    }
+                } else {
+                    // TODO: emit error
+                }
+            }
+
+            // Parse return types
+            let mut return_list = Vec::new();
+            if let Some(return_types) = node.child_by_field_id(*RETURN_TYPE) {
+                return_list = Vec::with_capacity(return_types.named_child_count());
+
+                for return_type in return_types.named_children(&mut return_types.walk()) {
+                    let mut type_cursor = if let Some(ref mut cursor) = type_cursor {
+                        cursor.reset(return_type);
+                        cursor
+                    } else {
+                        type_cursor = Some(return_type.walk());
+                        type_cursor.as_mut().unwrap()
+                    };
+
+                    if let Ok(typ) = Type::parse(document, &mut type_cursor, types) {
+                        return_list.push(typ);
+                    } else {
+                        // TODO: emit error
+                    }
+                }
+            }
+            Ok(Type::Function(FunctionType {
+                arguments: arg_list,
+                varargs,
+                return_types: return_list,
+            }))
+        } else {
+            todo!()
         }
-
-        Ok(Self::Basic(BasicType::Any)) // TODO
     }
 }
 
@@ -323,10 +410,6 @@ impl Document {
             types: &mut Vec<Declaration>,
             scope: &mut Scope,
         ) -> Vec<Diagnostic> {
-            static LANGUAGE: Lazy<Language> = Lazy::new(|| tree_sitter_teal::language());
-            node_kind!(PROGRAM, "program");
-            node_kind!(RECORD_DECLARATION, "record_declaration");
-
             let ret = Vec::new();
 
             let node = cursor.node();
