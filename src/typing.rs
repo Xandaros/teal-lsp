@@ -31,6 +31,7 @@ node_kind!(SIMPLE_TYPE, "simple_type");
 node_kind!(TYPE_INDEX, "type_index");
 node_kind!(TABLE_TYPE, "table_type");
 node_kind!(FUNCTION_TYPE, "function_type");
+node_kind!(TYPE_UNION, "type_union");
 node_kind!(ARG, "arg");
 node_kind!(VARARGS, "varargs");
 field_kind!(KEY, "key");
@@ -64,6 +65,7 @@ enum Type {
     Map(Box<Type>, Box<Type>),
     Function(FunctionType),
     UserDefined(usize),
+    Union(Box<Type>, Box<Type>),
     Unresolved(String),
 }
 
@@ -358,8 +360,20 @@ impl Parsable for Type {
                 varargs,
                 return_types: return_list,
             }))
+        } else if node.kind_id() == *TYPE_UNION {
+            cursor.goto_first_child();
+
+            let left = Type::parse(document, cursor, types)?;
+            cursor.goto_next_sibling();
+            cursor.goto_next_sibling();
+            let right = Type::parse(document, cursor, types)?;
+
+            assert!(!cursor.goto_next_sibling());
+
+            cursor.goto_parent();
+            Ok(Type::Union(Box::new(left), Box::new(right)))
         } else {
-            todo!()
+            panic!("Unknown type node: {:?}", node);
         }
     }
 }
