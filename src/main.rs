@@ -1,8 +1,14 @@
+#![allow(dead_code, unused)]
+use clap::clap_app;
 use log::{error, warn};
 use once_cell::sync::Lazy;
+use regex::Regex;
 use serde_json::Value;
 use std::{collections::HashMap, sync::Arc};
-use tokio::sync::RwLock;
+use tokio::{
+    io::{AsyncRead, AsyncWrite},
+    sync::RwLock,
+};
 use tower_lsp::{
     jsonrpc::Result as TResult, lsp_types::*, Client, LanguageServer, LspService, Server,
 };
@@ -613,21 +619,33 @@ impl LanguageServer for Backend {
 
 #[tokio::main]
 async fn main() -> Result<(), std::io::Error> {
+    let clapapp = clap_app!(app =>
+        (version: "0.1")
+        (author: "Martin Zeller")
+        (@arg listen: -l --listen +takes_value "Listen on TCP port instead of using stdin/stdout")
+    );
+    let matches = clapapp.get_matches();
     // let stdin = tokio::io::stdin();
     // let stdout = tokio::io::stdout();
     loop {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:9527").await?;
-        let (stream, _) = listener.accept().await?;
-        let (read, write) = tokio::io::split(stream);
-
         let (service, messages) = LspService::new(|client| Backend {
             _client: client,
             documents: Arc::new(RwLock::new(HashMap::new())),
         });
 
-        Server::new(read, write)
-            .interleave(messages)
-            .serve(service)
-            .await;
+        if let Some(listen) = matches.value_of("listen") {
+            let listener = tokio::net::TcpListener::bind(listen).await?;
+            let (stream, _) = listener.accept().await?;
+            let (read, write) = tokio::io::split(stream);
+            Server::new(read, write)
+                .interleave(messages)
+                .serve(service)
+                .await;
+        } else {
+            Server::new(tokio::io::stdin(), tokio::io::stdout())
+                .interleave(messages)
+                .serve(service)
+                .await;
+        };
     }
 }
