@@ -2,8 +2,8 @@ use std::{cell::RefCell, collections::HashMap, convert::TryFrom, rc::Rc};
 
 use anyhow::{Error, Result};
 use once_cell::{sync::Lazy, unsync::OnceCell};
-use tower_lsp::lsp_types::Diagnostic;
-use tree_sitter::{Language, Node, Query, TreeCursor};
+use tower_lsp::lsp_types::*;
+use tree_sitter::{Language, Node, Query, Range, TreeCursor};
 
 use crate::Document;
 
@@ -42,11 +42,31 @@ field_kind!(NAME, "name");
 field_kind!(ARGUMENTS, "arguments");
 field_kind!(RETURN_TYPE, "return_type");
 
+fn mk_diagnostic(range: Range, message: String, severity: DiagnosticSeverity) -> Diagnostic {
+    let mut ret = Diagnostic::default();
+    ret.source = Some("teal-lsp".to_string());
+    ret.range = tower_lsp::lsp_types::Range::new(
+        Position {
+            line: range.start_point.row as u32,
+            character: range.start_point.column as u32,
+        },
+        Position {
+            line: range.end_point.row as u32,
+            character: range.end_point.column as u32,
+        },
+    );
+    ret.message = message;
+    ret.severity = Some(severity);
+    ret
+}
+
 trait Parsable: Sized {
     fn parse(
         document: &Document,
         cursor: &mut TreeCursor,
-        types: &Vec<Declaration>,
+        scope: &Scope,
+        types: &Vec<Option<Declaration>>,
+        diagnostics: &mut Vec<Diagnostic>,
     ) -> Result<Self>;
 }
 
@@ -141,7 +161,9 @@ impl Parsable for RecordField {
     fn parse(
         document: &Document,
         cursor: &mut TreeCursor,
-        types: &Vec<Declaration>,
+        scope: &Scope,
+        types: &Vec<Option<Declaration>>,
+        diagnostics: &mut Vec<Diagnostic>,
     ) -> Result<Self> {
         let node = cursor.node();
         let key = node
@@ -152,7 +174,11 @@ impl Parsable for RecordField {
             if let Ok(text) = key.utf8_text(document.source.as_bytes()) {
                 text
             } else {
-                // TODO: emit warning
+                diagnostics.push(mk_diagnostic(
+                    key.range(),
+                    "UTF-8 decode failed".to_string(),
+                    DiagnosticSeverity::Error,
+                ));
                 ""
             }
         } else {
@@ -160,7 +186,11 @@ impl Parsable for RecordField {
                 if let Ok(text) = node.utf8_text(document.source.as_bytes()) {
                     text
                 } else {
-                    // TODO: Emit warning
+                    diagnostics.push(mk_diagnostic(
+                        node.range(),
+                        "UTF-8 decode failed".to_string(),
+                        DiagnosticSeverity::Error,
+                    ));
                     ""
                 }
             } else {
@@ -172,8 +202,17 @@ impl Parsable for RecordField {
 
         Ok(RecordField {
             name: name.to_string(),
-            typ: Type::parse(document, &mut typ.walk(), types)?,
+            typ: Type::parse(document, &mut typ.walk(), scope, types, diagnostics)?,
         })
+    }
+}
+
+impl<'a> RecordDeclaration {
+    fn get_name(document: &'a Document, node: &Node) -> &'a str {
+        node.child_by_field_id(*NAME)
+            .unwrap_or_else(|| panic!("No name for record {:?}", node))
+            .utf8_text(document.source.as_bytes())
+            .unwrap_or_else(|_| panic!("Could not decode record name for {:?}", node))
     }
 }
 
@@ -181,14 +220,13 @@ impl Parsable for RecordDeclaration {
     fn parse(
         document: &Document,
         cursor: &mut TreeCursor,
-        types: &Vec<Declaration>,
+        scope: &Scope,
+        types: &Vec<Option<Declaration>>,
+        diagnostics: &mut Vec<Diagnostic>,
     ) -> Result<Self> {
         let node = cursor.node();
-        let name = node
-            .child_by_field_id(*NAME)
-            .unwrap_or_else(|| panic!("No name for record {:?}", node))
-            .utf8_text(document.source.as_bytes())
-            .unwrap_or_else(|_| panic!("Could not decode record name for {:?}", node));
+        let name = Self::get_name(document, &node);
+        let id = types.len();
 
         let mut type_args = Vec::new();
         let mut members: HashMap<String, RecordMember> = HashMap::new();
@@ -210,7 +248,11 @@ impl Parsable for RecordDeclaration {
                             Ok(text) => type_args.push(text.to_string()),
                             Err(_) => {
                                 type_args.push("#ERROR#".to_string());
-                                //TODO: Emit warning
+                                diagnostics.push(mk_diagnostic(
+                                    node.range(),
+                                    "UTF-8 decode failed".to_string(),
+                                    DiagnosticSeverity::Error,
+                                ));
                             }
                         }
                     }
@@ -232,15 +274,26 @@ impl Parsable for RecordDeclaration {
                         cursor.goto_first_child();
                         match cursor.node().utf8_text(document.source.as_bytes()) {
                             Ok(typ) => {
-                                array_type = Some(Type::parse(document, cursor, types)?);
+                                array_type =
+                                    Some(Type::parse(document, cursor, scope, types, diagnostics)?);
                             }
                             Err(_) => {
-                                //TODO: Emit warning
+                                diagnostics.push(mk_diagnostic(
+                                    cursor.node().range(),
+                                    "UTF-8 decode failed".to_string(),
+                                    DiagnosticSeverity::Error,
+                                ));
                             }
                         }
                         cursor.goto_parent();
                     } else if node.kind_id() == *RECORD_ENTRY {
-                        let member = RecordField::parse(document, &mut node.walk(), types)?;
+                        let member = RecordField::parse(
+                            document,
+                            &mut node.walk(),
+                            scope,
+                            types,
+                            diagnostics,
+                        )?;
                         members.insert(member.name.clone(), RecordMember::Field(member));
                     }
 
@@ -273,7 +326,9 @@ impl Parsable for Type {
     fn parse(
         document: &Document,
         cursor: &mut TreeCursor,
-        types: &Vec<Declaration>,
+        scope: &Scope,
+        types: &Vec<Option<Declaration>>,
+        diagnostics: &mut Vec<Diagnostic>,
     ) -> Result<Self> {
         // _type: $ => prec(2, choice(
         //   $.simple_type,
@@ -283,8 +338,6 @@ impl Parsable for Type {
         //   $.type_union,
         //   seq("(", $._type, ")")
         // )),
-        println!("Parsing type: {:?}", cursor.node().to_sexp());
-
         let node = cursor.node();
 
         if node.kind_id() == *SIMPLE_TYPE {
@@ -293,16 +346,25 @@ impl Parsable for Type {
             if let Ok(typ) = BasicType::try_from(text) {
                 Ok(Type::Basic(typ))
             } else {
-                todo!()
+                if let Some(typeid) = scope.find_type(text) {
+                    Ok(Type::UserDefined(typeid))
+                } else {
+                    diagnostics.push(mk_diagnostic(
+                        node.range(),
+                        format!("Type not found: {}", text),
+                        DiagnosticSeverity::Error,
+                    ));
+                    Ok(Type::Basic(BasicType::Any))
+                }
             }
         } else if node.kind_id() == *TYPE_INDEX {
             todo!();
         } else if node.kind_id() == *TABLE_TYPE {
             cursor.goto_first_child();
 
-            let key_type = Type::parse(document, cursor, types)?;
+            let key_type = Type::parse(document, cursor, scope, types, diagnostics)?;
             cursor.goto_next_sibling();
-            let value_type = Type::parse(document, cursor, types)?;
+            let value_type = Type::parse(document, cursor, scope, types, diagnostics)?;
 
             cursor.goto_parent();
             Ok(Type::Map(Box::new(key_type), Box::new(value_type)))
@@ -323,7 +385,8 @@ impl Parsable for Type {
                     type_cursor.as_mut().unwrap()
                 };
 
-                if let Ok(typ) = Type::parse(document, &mut type_cursor, types) {
+                if let Ok(typ) = Type::parse(document, &mut type_cursor, scope, types, diagnostics)
+                {
                     if argument.kind_id() == *ARG {
                         arg_list.push(typ);
                     } else if argument.kind_id() == *VARARGS {
@@ -348,7 +411,9 @@ impl Parsable for Type {
                         type_cursor.as_mut().unwrap()
                     };
 
-                    if let Ok(typ) = Type::parse(document, &mut type_cursor, types) {
+                    if let Ok(typ) =
+                        Type::parse(document, &mut type_cursor, scope, types, diagnostics)
+                    {
                         return_list.push(typ);
                     } else {
                         // TODO: emit error
@@ -363,10 +428,10 @@ impl Parsable for Type {
         } else if node.kind_id() == *TYPE_UNION {
             cursor.goto_first_child();
 
-            let left = Type::parse(document, cursor, types)?;
+            let left = Type::parse(document, cursor, scope, types, diagnostics)?;
             cursor.goto_next_sibling();
             cursor.goto_next_sibling();
-            let right = Type::parse(document, cursor, types)?;
+            let right = Type::parse(document, cursor, scope, types, diagnostics)?;
 
             assert!(!cursor.goto_next_sibling());
 
@@ -417,33 +482,47 @@ impl Scope {
 }
 
 impl Document {
-    pub(crate) fn check_types(&self) -> Vec<Diagnostic> {
+    pub(crate) fn check_types(&self, diagnostics: &mut Vec<Diagnostic>) {
         fn do_check(
             document: &Document,
             cursor: &mut TreeCursor,
-            types: &mut Vec<Declaration>,
             scope: &mut Scope,
-        ) -> Vec<Diagnostic> {
-            let ret = Vec::new();
+            types: &mut Vec<Option<Declaration>>,
+            diagnostics: &mut Vec<Diagnostic>,
+        ) {
+            loop {
+                let node = cursor.node();
+                if node.kind_id() == *PROGRAM {
+                    cursor.goto_first_child();
+                    do_check(document, cursor, scope, types, diagnostics);
+                    cursor.goto_parent();
+                } else if node.kind_id() == *RECORD_DECLARATION {
+                    let id = types.len();
+                    let name = RecordDeclaration::get_name(document, &node);
+                    types.push(None);
+                    scope.declarations.insert(name.to_string(), id);
+                    if let Ok(decl) =
+                        RecordDeclaration::parse(document, cursor, scope, types, diagnostics)
+                    {
+                        let name = decl.name.clone();
+                        types[id] = Some(Declaration::Record(decl));
+                    }
+                }
 
-            let node = cursor.node();
-            if node.kind_id() == *PROGRAM {
-                cursor.goto_first_child();
-                do_check(document, cursor, types, scope);
-                cursor.goto_parent();
-            } else if node.kind_id() == *RECORD_DECLARATION {
-                if let Ok(decl) = RecordDeclaration::parse(document, cursor, types) {
-                    let name = decl.name.clone();
-                    types.push(Declaration::Record(decl));
-                    scope.declarations.insert(name, types.len() - 1);
+                if !cursor.goto_next_sibling() {
+                    break;
                 }
             }
-
-            ret
         }
 
         let mut global_scope = Scope::new();
         let mut types = Vec::new();
-        do_check(self, &mut self.tree.walk(), &mut types, &mut global_scope)
+        do_check(
+            self,
+            &mut self.tree.walk(),
+            &mut global_scope,
+            &mut types,
+            diagnostics,
+        );
     }
 }

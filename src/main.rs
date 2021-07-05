@@ -106,7 +106,7 @@ impl Backend {
         }
     }
 
-    async fn report_syntax_errors(&self) {
+    async fn report_errors(&self) {
         let documents = self.documents.read().await;
         for (url, document) in documents.iter() {
             let mut diagnostics = Vec::new();
@@ -116,6 +116,7 @@ impl Backend {
                     self.collect_syntax_errors(document.tree.root_node(), &mut diagnostics);
                 }
             }
+            document.check_types(&mut diagnostics);
             println!("{:?}", diagnostics);
             self._client
                 .publish_diagnostics(url.clone(), diagnostics, None)
@@ -233,12 +234,11 @@ impl LanguageServer for Backend {
                 tree,
                 source: params.text_document.text,
             };
-            document.check_types();
             let mut documents = self.documents.write().await;
             documents.insert(url, document);
         }
 
-        self.report_syntax_errors().await;
+        self.report_errors().await;
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
@@ -304,7 +304,8 @@ impl LanguageServer for Backend {
                         old_end_position: get_last_line_col(&source),
                         new_end_position: get_last_line_col(&change.text),
                     };
-                    source = change.text;
+                    source = change.text.clone();
+                    document.source = change.text;
                     edit
                 };
 
@@ -316,7 +317,7 @@ impl LanguageServer for Backend {
             }
         }
 
-        self.report_syntax_errors().await;
+        self.report_errors().await;
     }
 
     async fn will_save(&self, params: WillSaveTextDocumentParams) {
