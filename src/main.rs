@@ -123,7 +123,6 @@ impl Backend {
                 }
             }
             document.check_types(&mut diagnostics);
-            println!("{:?}", diagnostics);
             self._client
                 .publish_diagnostics(url.clone(), diagnostics, None)
                 .await;

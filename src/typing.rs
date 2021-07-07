@@ -1,4 +1,4 @@
-use std::{cell::RefCell, collections::HashMap, convert::TryFrom};
+use std::{cell::RefCell, collections::HashMap, convert::TryFrom, mem, ops::Deref, rc::Rc};
 
 use anyhow::{Error, Result};
 use once_cell::{sync::Lazy, unsync::OnceCell};
@@ -61,14 +61,9 @@ fn mk_diagnostic(range: Range, message: String, severity: DiagnosticSeverity) ->
     ret
 }
 
-trait Parsable: Sized {
-    fn parse(
-        document: &Document,
-        cursor: &mut TreeCursor,
-        scope: &Scope,
-        types: &mut Vec<Option<Declaration>>,
-        diagnostics: &mut Vec<Diagnostic>,
-    ) -> Result<Self>;
+enum TypeLookupError {
+    NotFound,
+    Unloaded(usize),
 }
 
 #[derive(Debug, Clone)]
@@ -80,6 +75,7 @@ struct FunctionType {
 
 #[derive(Clone, Debug)]
 enum Type {
+    Any,
     Basic(BasicType),
     Array(BasicType),
     Tuple(Vec<BasicType>),
@@ -87,7 +83,6 @@ enum Type {
     Function(FunctionType),
     UserDefined(usize),
     Union(Box<Type>, Box<Type>),
-    Unresolved(String),
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -151,21 +146,97 @@ enum Declaration {
     Record(RecordDeclaration),
 }
 
-#[derive(Clone, Debug)]
-struct Scope<'a> {
+#[derive(Debug)]
+struct Scope {
     declarations: HashMap<String, usize>,
+    unloaded_declarations: HashMap<String, (usize, usize)>,
     variables: HashMap<String, Type>,
-    parent: Option<&'a Scope<'a>>,
+    parent: Option<Rc<RefCell<Scope>>>,
 }
 
-impl Parsable for RecordField {
-    fn parse(
+impl Scope {
+    fn resolve(
+        scope: Rc<RefCell<Self>>,
         document: &Document,
-        cursor: &mut TreeCursor,
-        scope: &Scope<'_>,
         types: &mut Vec<Option<Declaration>>,
+        nodes: &mut HashMap<usize, Node>,
+        diagnostics: &mut Vec<Diagnostic>,
+    ) {
+        let unloaded_declarations = scope.borrow().unloaded_declarations.clone();
+        for (name, (node_id, type_id)) in unloaded_declarations.into_iter() {
+            if Scope::resolve_one(
+                Rc::clone(&scope),
+                document,
+                types,
+                nodes,
+                diagnostics,
+                name.clone(),
+            )
+            .is_none()
+            {
+                diagnostics.push(mk_diagnostic(
+                    nodes.get(&node_id).unwrap().range(),
+                    format!("Type not found: {}", name),
+                    DiagnosticSeverity::Error,
+                ));
+            }
+        }
+    }
+
+    fn resolve_one(
+        scope: Rc<RefCell<Self>>,
+        document: &Document,
+        types: &mut Vec<Option<Declaration>>,
+        nodes: &mut HashMap<usize, Node>,
+        diagnostics: &mut Vec<Diagnostic>,
+        name: String,
+    ) -> Option<usize> {
+        println!("Resolving: {}", name);
+        if let Some(typeid) = scope.borrow().declarations.get(&name) {
+            return Some(*typeid);
+        }
+        let decl_entry = { scope.borrow().unloaded_declarations.get(&name).map(|x| *x) };
+        if let Some((node_id, id)) = decl_entry {
+            let node = nodes.get(&node_id).unwrap();
+
+            if node.kind_id() == *RECORD_DECLARATION {
+                scope.borrow_mut().unloaded_declarations.remove(&name);
+                scope.borrow_mut().declarations.insert(name.clone(), id);
+                let record = RecordDeclaration::parse(
+                    document,
+                    &mut node.walk(),
+                    Rc::clone(&scope),
+                    types,
+                    nodes,
+                    diagnostics,
+                )
+                .ok()?;
+                let decl = Declaration::Record(record);
+                types[id] = Some(decl);
+                println!("Finished resolving {}", name);
+                return Some(id);
+            } else {
+                todo!()
+            }
+        } else if let Some(parent) = scope.borrow().parent.clone() {
+            Scope::resolve_one(parent, document, types, nodes, diagnostics, name)
+        } else {
+            println!("Failed to resolve: {}", name);
+            None
+        }
+    }
+}
+
+impl RecordField {
+    fn parse<'a>(
+        document: &Document,
+        cursor: &mut TreeCursor<'a>,
+        scope: Rc<RefCell<Scope>>,
+        types: &mut Vec<Option<Declaration>>,
+        nodes: &mut HashMap<usize, Node>,
         diagnostics: &mut Vec<Diagnostic>,
     ) -> Result<Self> {
+        println!("Parse record field");
         let node = cursor.node();
         let key = node
             .child_by_field_id(*KEY)
@@ -203,28 +274,45 @@ impl Parsable for RecordField {
 
         Ok(RecordField {
             name: name.to_string(),
-            typ: Type::parse(document, &mut typ.walk(), scope, types, diagnostics)?,
+            typ: Type::parse(document, &mut typ.walk(), scope, types, nodes, diagnostics)?,
         })
     }
 }
 
-impl<'a> RecordDeclaration {
-    fn get_name(document: &'a Document, node: &Node) -> &'a str {
+impl RecordDeclaration {
+    fn get_name<'a>(document: &'a Document, node: &Node) -> &'a str {
         node.child_by_field_id(*NAME)
             .unwrap_or_else(|| panic!("No name for record {:?}", node))
             .utf8_text(document.source.as_bytes())
             .unwrap_or_else(|_| panic!("Could not decode record name for {:?}", node))
     }
-}
 
-impl Parsable for RecordDeclaration {
-    fn parse(
-        document: &Document,
-        cursor: &mut TreeCursor,
-        scope: &Scope<'_>,
+    fn resolve(
+        &mut self,
+        scope: Rc<RefCell<Scope>>,
         types: &mut Vec<Option<Declaration>>,
         diagnostics: &mut Vec<Diagnostic>,
+    ) {
+        for (name, member) in self.members.iter_mut() {
+            if let RecordMember::Declaration(decl) = member {
+                if let Declaration::Record(ref mut record_decl) = decl {
+                    record_decl.resolve(Rc::clone(&scope), types, diagnostics);
+                }
+            }
+        }
+    }
+}
+
+impl RecordDeclaration {
+    fn parse<'a>(
+        document: &Document,
+        cursor: &mut TreeCursor<'a>,
+        scope: Rc<RefCell<Scope>>,
+        types: &mut Vec<Option<Declaration>>,
+        nodes: &mut HashMap<usize, Node<'a>>,
+        diagnostics: &mut Vec<Diagnostic>,
     ) -> Result<Self> {
+        println!("Parse record decl");
         let node = cursor.node();
         let name = Self::get_name(document, &node);
         let id = types.len();
@@ -266,7 +354,7 @@ impl Parsable for RecordDeclaration {
 
                 cursor.goto_parent();
             } else if node.kind_id() == *RECORD_BODY {
-                let mut record_scope = scope.child();
+                let mut record_scope = Scope::child(Rc::clone(&scope));
 
                 // Parse records, enums, and typedefs first
                 {
@@ -276,20 +364,15 @@ impl Parsable for RecordDeclaration {
                         let node = cursor.node();
 
                         if node.kind_id() == *RECORD_DECLARATION {
-                            let id = types.len();
-                            let name = RecordDeclaration::get_name(document, &node);
-                            types.push(None);
-                            record_scope.declarations.insert(name.to_string(), id);
-                            if let Ok(decl) = RecordDeclaration::parse(
+                            check_type(
                                 document,
                                 cursor,
-                                &mut record_scope,
+                                Rc::clone(&record_scope),
                                 types,
+                                nodes,
                                 diagnostics,
-                            ) {
-                                let name = decl.name.clone();
-                                types[id] = Some(Declaration::Record(decl.clone()));
-                            }
+                                false,
+                            );
                         }
 
                         if !cursor.goto_next_sibling() {
@@ -314,8 +397,9 @@ impl Parsable for RecordDeclaration {
                                     array_type = Some(Type::parse(
                                         document,
                                         cursor,
-                                        &record_scope,
+                                        Rc::clone(&record_scope),
                                         types,
+                                        nodes,
                                         diagnostics,
                                     )?);
                                 }
@@ -332,11 +416,13 @@ impl Parsable for RecordDeclaration {
                             let member = RecordField::parse(
                                 document,
                                 &mut node.walk(),
-                                &record_scope,
+                                Rc::clone(&record_scope),
                                 types,
+                                nodes,
                                 diagnostics,
                             )?;
                             members.insert(member.name.clone(), RecordMember::Field(member));
+                            nodes.insert(node.id(), node);
                         }
 
                         if !cursor.goto_next_sibling() {
@@ -364,14 +450,16 @@ impl Parsable for RecordDeclaration {
     }
 }
 
-impl Parsable for Type {
-    fn parse(
+impl Type {
+    fn parse<'a>(
         document: &Document,
-        cursor: &mut TreeCursor,
-        scope: &Scope,
+        cursor: &mut TreeCursor<'a>,
+        scope: Rc<RefCell<Scope>>,
         types: &mut Vec<Option<Declaration>>,
+        nodes: &mut HashMap<usize, Node>,
         diagnostics: &mut Vec<Diagnostic>,
     ) -> Result<Self> {
+        println!("Parse type");
         // _type: $ => prec(2, choice(
         //   $.simple_type,
         //   $.type_index,
@@ -388,15 +476,35 @@ impl Parsable for Type {
             if let Ok(typ) = BasicType::try_from(text) {
                 Ok(Type::Basic(typ))
             } else {
-                if let Some(typeid) = scope.find_type(text) {
-                    Ok(Type::UserDefined(typeid))
-                } else {
-                    diagnostics.push(mk_diagnostic(
-                        node.range(),
-                        format!("Type not found: {}", text),
-                        DiagnosticSeverity::Error,
-                    ));
-                    Ok(Type::Basic(BasicType::Any))
+                match scope.borrow().find_type(text) {
+                    Ok(typeid) => Ok(Type::UserDefined(typeid)),
+                    Err(TypeLookupError::Unloaded(node)) => {
+                        println!("Loading type: {}", text);
+                        if let Some(typeid) = Scope::resolve_one(
+                            Rc::clone(&scope),
+                            document,
+                            types,
+                            nodes,
+                            diagnostics,
+                            text.to_string(),
+                        ) {
+                            println!("Successfully resolved: {}", text);
+                            println!("{:?}", scope);
+                            Ok(Type::UserDefined(typeid))
+                        } else {
+                            todo!()
+                        }
+                    }
+                    Err(TypeLookupError::NotFound) => {
+                        println!("Could not look up type: {}", text);
+                        println!("{:#?}", scope);
+                        diagnostics.push(mk_diagnostic(
+                            node.range(),
+                            format!("Type not found: {}", text),
+                            DiagnosticSeverity::Error,
+                        ));
+                        Ok(Type::Any)
+                    }
                 }
             }
         } else if node.kind_id() == *TYPE_INDEX {
@@ -404,9 +512,16 @@ impl Parsable for Type {
         } else if node.kind_id() == *TABLE_TYPE {
             cursor.goto_first_child();
 
-            let key_type = Type::parse(document, cursor, scope, types, diagnostics)?;
+            let key_type = Type::parse(
+                document,
+                cursor,
+                Rc::clone(&scope),
+                types,
+                nodes,
+                diagnostics,
+            )?;
             cursor.goto_next_sibling();
-            let value_type = Type::parse(document, cursor, scope, types, diagnostics)?;
+            let value_type = Type::parse(document, cursor, scope, types, nodes, diagnostics)?;
 
             cursor.goto_parent();
             Ok(Type::Map(Box::new(key_type), Box::new(value_type)))
@@ -427,12 +542,26 @@ impl Parsable for Type {
                     type_cursor.as_mut().unwrap()
                 };
 
-                if let Ok(typ) = Type::parse(document, &mut type_cursor, scope, types, diagnostics)
-                {
+                if let Ok(typ) = Type::parse(
+                    document,
+                    &mut type_cursor,
+                    Rc::clone(&scope),
+                    types,
+                    nodes,
+                    diagnostics,
+                ) {
                     if argument.kind_id() == *ARG {
                         arg_list.push(typ);
+                        // arg_list.push(NodeType {
+                        //     typ,
+                        //     node: argument.clone(),
+                        // });
                     } else if argument.kind_id() == *VARARGS {
                         varargs = Some(Box::new(typ));
+                        // varargs = Some(Box::new(NodeType {
+                        //     typ,
+                        //     node: argument.clone(),
+                        // }));
                     }
                 } else {
                     // TODO: emit error
@@ -453,10 +582,19 @@ impl Parsable for Type {
                         type_cursor.as_mut().unwrap()
                     };
 
-                    if let Ok(typ) =
-                        Type::parse(document, &mut type_cursor, scope, types, diagnostics)
-                    {
+                    if let Ok(typ) = Type::parse(
+                        document,
+                        &mut type_cursor,
+                        Rc::clone(&scope),
+                        types,
+                        nodes,
+                        diagnostics,
+                    ) {
                         return_list.push(typ);
+                        // return_list.push(NodeType {
+                        //     typ,
+                        //     node: return_type.clone(),
+                        // });
                     } else {
                         // TODO: emit error
                     }
@@ -470,10 +608,17 @@ impl Parsable for Type {
         } else if node.kind_id() == *TYPE_UNION {
             cursor.goto_first_child();
 
-            let left = Type::parse(document, cursor, scope, types, diagnostics)?;
+            let left = Type::parse(
+                document,
+                cursor,
+                Rc::clone(&scope),
+                types,
+                nodes,
+                diagnostics,
+            )?;
             cursor.goto_next_sibling();
             cursor.goto_next_sibling();
-            let right = Type::parse(document, cursor, scope, types, diagnostics)?;
+            let right = Type::parse(document, cursor, scope, types, nodes, diagnostics)?;
 
             assert!(!cursor.goto_next_sibling());
 
@@ -485,13 +630,14 @@ impl Parsable for Type {
     }
 }
 
-impl<'a> Scope<'a> {
-    fn new() -> Self {
-        Self {
+impl<'a> Scope {
+    fn new() -> Rc<RefCell<Self>> {
+        Rc::new(RefCell::new(Self {
             declarations: HashMap::new(),
+            unloaded_declarations: HashMap::new(),
             variables: HashMap::new(),
             parent: None,
-        }
+        }))
     }
 
     fn find_variable(&self, name: &str) -> Option<Type> {
@@ -499,36 +645,43 @@ impl<'a> Scope<'a> {
             return Some(typ.clone());
         }
         if let Some(ref parent) = self.parent {
-            parent.find_variable(name)
+            parent.borrow().find_variable(name)
         } else {
             None
         }
     }
 
-    fn find_type(&self, name: &str) -> Option<usize> {
-        if let Some(declaration) = self.declarations.get(name) {
-            return Some(declaration.clone());
+    fn find_type(&self, name: &str) -> Result<usize, TypeLookupError> {
+        println!("Find type: {}", name);
+        println!("{:?}", self);
+        if let Some((node, type_id)) = self.unloaded_declarations.get(name) {
+            println!("Lazy: {}", name);
+            return Err(TypeLookupError::Unloaded(*node));
+        } else if let Some(declaration) = self.declarations.get(name) {
+            return Ok(*declaration);
         }
         if let Some(ref parent) = self.parent {
-            parent.find_type(name)
+            parent.borrow().find_type(name)
         } else {
-            None
+            Err(TypeLookupError::NotFound)
         }
     }
 
-    fn child(&'a self) -> Scope<'a> {
+    fn child(parent: Rc<RefCell<Self>>) -> Rc<RefCell<Scope>> {
         let mut ret = Self::new();
-        ret.parent = Some(self);
+        ret.borrow_mut().parent = Some(parent);
         ret
     }
 }
 
-fn check_type(
+fn check_type<'a>(
     document: &Document,
-    cursor: &mut TreeCursor,
-    global_scope: &mut Scope,
+    cursor: &mut TreeCursor<'a>,
+    global_scope: Rc<RefCell<Scope>>,
     types: &mut Vec<Option<Declaration>>,
+    nodes: &mut HashMap<usize, Node<'a>>,
     diagnostics: &mut Vec<Diagnostic>,
+    lazy: bool,
 ) {
     let node = cursor.node();
     if node.kind_id() == *PROGRAM {
@@ -538,7 +691,15 @@ fn check_type(
         }
 
         loop {
-            check_type(document, cursor, global_scope, types, diagnostics);
+            check_type(
+                document,
+                cursor,
+                Rc::clone(&global_scope),
+                types,
+                nodes,
+                diagnostics,
+                lazy,
+            );
 
             if !cursor.goto_next_sibling() {
                 break;
@@ -549,13 +710,26 @@ fn check_type(
     } else if node.kind_id() == *RECORD_DECLARATION {
         let id = types.len();
         let name = RecordDeclaration::get_name(document, &node);
-        types.push(None);
-        global_scope.declarations.insert(name.to_string(), id);
-        if let Ok(decl) =
-            RecordDeclaration::parse(document, cursor, global_scope, types, diagnostics)
-        {
-            let name = decl.name.clone();
-            types[id] = Some(Declaration::Record(decl));
+        nodes.insert(node.id(), node.clone());
+        if lazy {
+            println!("Inserting unloaded decl {}", name);
+            types.push(None);
+            global_scope
+                .borrow_mut()
+                .unloaded_declarations
+                .insert(name.to_string(), (node.id(), id));
+        } else {
+            types.push(None);
+            global_scope
+                .borrow_mut()
+                .declarations
+                .insert(name.to_string(), id);
+            if let Ok(decl) =
+                RecordDeclaration::parse(document, cursor, global_scope, types, nodes, diagnostics)
+            {
+                let name = decl.name.clone();
+                types[id] = Some(Declaration::Record(decl));
+            }
         }
     }
 }
@@ -564,11 +738,21 @@ impl Document {
     pub(crate) fn check_types(&self, diagnostics: &mut Vec<Diagnostic>) {
         let mut global_scope = Scope::new();
         let mut types = Vec::new();
+        let mut nodes = HashMap::new();
         check_type(
             self,
             &mut self.tree.walk(),
-            &mut global_scope,
+            global_scope.clone(),
             &mut types,
+            &mut nodes,
+            diagnostics,
+            true,
+        );
+        Scope::resolve(
+            global_scope.clone(),
+            self,
+            &mut types,
+            &mut nodes,
             diagnostics,
         );
     }
