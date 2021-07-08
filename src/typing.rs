@@ -1,4 +1,6 @@
-use std::{cell::RefCell, collections::HashMap, convert::TryFrom, mem, ops::Deref, rc::Rc};
+use std::{
+    borrow::Cow, cell::RefCell, collections::HashMap, convert::TryFrom, mem, ops::Deref, rc::Rc,
+};
 
 use anyhow::{Error, Result};
 use once_cell::{sync::Lazy, unsync::OnceCell};
@@ -75,7 +77,6 @@ struct FunctionType {
 
 #[derive(Clone, Debug)]
 enum Type {
-    Any,
     Basic(BasicType),
     Array(BasicType),
     Tuple(Vec<BasicType>),
@@ -137,7 +138,7 @@ struct RecordField {
 #[derive(Clone, Debug)]
 enum RecordMember {
     Field(RecordField),
-    Declaration(Declaration),
+    Declaration(usize),
 }
 
 #[derive(Clone, Debug)]
@@ -152,6 +153,20 @@ struct Scope {
     unloaded_declarations: HashMap<String, (usize, usize)>,
     variables: HashMap<String, Type>,
     parent: Option<Rc<RefCell<Scope>>>,
+}
+
+impl BasicType {
+    fn to_string(&self) -> &str {
+        match *self {
+            BasicType::Any => "any",
+            BasicType::Nil => "nil",
+            BasicType::Boolean => "boolean",
+            BasicType::Integer => "integer",
+            BasicType::Number => "number",
+            BasicType::String => "string",
+            BasicType::Thread => "thread",
+        }
+    }
 }
 
 impl Scope {
@@ -191,7 +206,6 @@ impl Scope {
         diagnostics: &mut Vec<Diagnostic>,
         name: String,
     ) -> Option<usize> {
-        println!("Resolving: {}", name);
         if let Some(typeid) = scope.borrow().declarations.get(&name) {
             return Some(*typeid);
         }
@@ -209,11 +223,11 @@ impl Scope {
                     types,
                     nodes,
                     diagnostics,
+                    id,
                 )
                 .ok()?;
                 let decl = Declaration::Record(record);
                 types[id] = Some(decl);
-                println!("Finished resolving {}", name);
                 return Some(id);
             } else {
                 todo!()
@@ -221,7 +235,6 @@ impl Scope {
         } else if let Some(parent) = scope.borrow().parent.clone() {
             Scope::resolve_one(parent, document, types, nodes, diagnostics, name)
         } else {
-            println!("Failed to resolve: {}", name);
             None
         }
     }
@@ -236,7 +249,6 @@ impl RecordField {
         nodes: &mut HashMap<usize, Node>,
         diagnostics: &mut Vec<Diagnostic>,
     ) -> Result<Self> {
-        println!("Parse record field");
         let node = cursor.node();
         let key = node
             .child_by_field_id(*KEY)
@@ -294,16 +306,16 @@ impl RecordDeclaration {
         diagnostics: &mut Vec<Diagnostic>,
     ) {
         for (name, member) in self.members.iter_mut() {
-            if let RecordMember::Declaration(decl) = member {
+            if let RecordMember::Declaration(id) = member {
+                let mut decl = types[*id].as_ref().unwrap().clone();
                 if let Declaration::Record(ref mut record_decl) = decl {
                     record_decl.resolve(Rc::clone(&scope), types, diagnostics);
                 }
+                types[*id] = Some(decl);
             }
         }
     }
-}
 
-impl RecordDeclaration {
     fn parse<'a>(
         document: &Document,
         cursor: &mut TreeCursor<'a>,
@@ -311,11 +323,10 @@ impl RecordDeclaration {
         types: &mut Vec<Option<Declaration>>,
         nodes: &mut HashMap<usize, Node<'a>>,
         diagnostics: &mut Vec<Diagnostic>,
+        id: usize,
     ) -> Result<Self> {
-        println!("Parse record decl");
         let node = cursor.node();
         let name = Self::get_name(document, &node);
-        let id = types.len();
 
         let mut type_args = Vec::new();
         let mut members: HashMap<String, RecordMember> = HashMap::new();
@@ -364,15 +375,27 @@ impl RecordDeclaration {
                         let node = cursor.node();
 
                         if node.kind_id() == *RECORD_DECLARATION {
-                            check_type(
+                            let id = types.len();
+                            let name = RecordDeclaration::get_name(document, &node);
+                            nodes.insert(node.id(), node.clone());
+                            types.push(None);
+                            record_scope
+                                .borrow_mut()
+                                .declarations
+                                .insert(name.to_string(), id);
+                            if let Ok(decl) = RecordDeclaration::parse(
                                 document,
                                 cursor,
                                 Rc::clone(&record_scope),
                                 types,
                                 nodes,
                                 diagnostics,
-                                false,
-                            );
+                                id,
+                            ) {
+                                let name = decl.name.clone();
+                                types[id] = Some(Declaration::Record(decl));
+                                members.insert(name, RecordMember::Declaration(id));
+                            }
                         }
 
                         if !cursor.goto_next_sibling() {
@@ -382,6 +405,13 @@ impl RecordDeclaration {
 
                     cursor.goto_parent();
                 }
+
+                types[id] = Some(Declaration::Record(RecordDeclaration {
+                    name: name.to_string(),
+                    array_type: array_type.clone(),
+                    type_args: type_args.clone(),
+                    members: members.clone(),
+                }));
 
                 // ...then everything else
                 {
@@ -451,6 +481,21 @@ impl RecordDeclaration {
 }
 
 impl Type {
+    fn to_string(&self, types: &mut Vec<Option<Declaration>>) -> Cow<str> {
+        match *self {
+            Type::Basic(kind) => Cow::from("basic"),
+            Type::Array(_) => Cow::from("array"),
+            Type::Tuple(_) => Cow::from("tuple"),
+            Type::Map(_, _) => Cow::from("map"),
+            Type::Function(_) => Cow::from("function"),
+            Type::UserDefined(id) => match types[id].as_ref().unwrap() {
+                Declaration::Enum(_) => todo!(),
+                Declaration::Record(record) => Cow::from(format!("Record {}", record.name)),
+            },
+            Type::Union(_, _) => Cow::from("union"),
+        }
+    }
+
     fn parse<'a>(
         document: &Document,
         cursor: &mut TreeCursor<'a>,
@@ -459,7 +504,6 @@ impl Type {
         nodes: &mut HashMap<usize, Node>,
         diagnostics: &mut Vec<Diagnostic>,
     ) -> Result<Self> {
-        println!("Parse type");
         // _type: $ => prec(2, choice(
         //   $.simple_type,
         //   $.type_index,
@@ -470,7 +514,7 @@ impl Type {
         // )),
         let node = cursor.node();
 
-        if node.kind_id() == *SIMPLE_TYPE {
+        if node.kind_id() == *IDENTIFIER {
             let text = node.utf8_text(document.source.as_bytes())?;
 
             if let Ok(typ) = BasicType::try_from(text) {
@@ -479,7 +523,6 @@ impl Type {
                 match scope.borrow().find_type(text) {
                     Ok(typeid) => Ok(Type::UserDefined(typeid)),
                     Err(TypeLookupError::Unloaded(node)) => {
-                        println!("Loading type: {}", text);
                         if let Some(typeid) = Scope::resolve_one(
                             Rc::clone(&scope),
                             document,
@@ -488,27 +531,95 @@ impl Type {
                             diagnostics,
                             text.to_string(),
                         ) {
-                            println!("Successfully resolved: {}", text);
-                            println!("{:?}", scope);
                             Ok(Type::UserDefined(typeid))
                         } else {
                             todo!()
                         }
                     }
                     Err(TypeLookupError::NotFound) => {
-                        println!("Could not look up type: {}", text);
-                        println!("{:#?}", scope);
                         diagnostics.push(mk_diagnostic(
                             node.range(),
                             format!("Type not found: {}", text),
                             DiagnosticSeverity::Error,
                         ));
-                        Ok(Type::Any)
+                        Ok(Type::Basic(BasicType::Any))
                     }
                 }
             }
+        } else if node.kind_id() == *SIMPLE_TYPE {
+            let name = node.child_by_field_id(*NAME).unwrap();
+
+            Type::parse(document, &mut name.walk(), scope, types, nodes, diagnostics)
         } else if node.kind_id() == *TYPE_INDEX {
-            todo!();
+            cursor.goto_first_child();
+
+            let left_node = cursor.node();
+            let left = Type::parse(document, cursor, scope, types, nodes, diagnostics)?;
+            let left_text = left_node.utf8_text(document.source.as_bytes())?;
+            cursor.goto_next_sibling();
+            let period = cursor.node();
+            cursor.goto_next_sibling();
+            let right_node = cursor.node();
+            let right_text = right_node.utf8_text(document.source.as_bytes())?;
+
+            cursor.goto_parent();
+
+            match &left {
+                Type::Basic(BasicType::Any) => Ok(Type::Basic(BasicType::Any)),
+                Type::UserDefined(typeid) => {
+                    if let Some(typ) = types[*typeid].as_ref() {
+                        match typ {
+                            Declaration::Enum(_) => todo!(),
+                            Declaration::Record(record) => {
+                                if let Some(decl) = record.members.get(right_text) {
+                                    match decl {
+                                        RecordMember::Field(_) => todo!(),
+                                        RecordMember::Declaration(inner_id) => {
+                                            Ok(Type::UserDefined(*inner_id))
+                                        }
+                                    }
+                                } else {
+                                    diagnostics.push(mk_diagnostic(
+                                        Range {
+                                            start_byte: right_node.start_byte(),
+                                            end_byte: right_node.end_byte(),
+                                            start_point: right_node.start_position(),
+                                            end_point: right_node.end_position(),
+                                        },
+                                        format!("{} not found in {}", right_text, left_text),
+                                        DiagnosticSeverity::Error,
+                                    ));
+                                    Ok(Type::Basic(BasicType::Any))
+                                }
+                            }
+                        }
+                    } else {
+                        Ok(Type::Basic(BasicType::Any))
+                    }
+                }
+                typ => {
+                    let type_kind = left.to_string(types);
+                    let message = {
+                        match typ {
+                            Type::Basic(basic) => {
+                                format!("Attempt to index basic type {}", basic.to_string())
+                            }
+                            _ => format!("Attempt to index {} type", type_kind),
+                        }
+                    };
+                    diagnostics.push(mk_diagnostic(
+                        Range {
+                            start_byte: left_node.start_byte(),
+                            end_byte: right_node.end_byte(),
+                            start_point: left_node.start_position(),
+                            end_point: right_node.end_position(),
+                        },
+                        message,
+                        DiagnosticSeverity::Error,
+                    ));
+                    Ok(Type::Basic(BasicType::Any))
+                }
+            }
         } else if node.kind_id() == *TABLE_TYPE {
             cursor.goto_first_child();
 
@@ -652,10 +763,7 @@ impl<'a> Scope {
     }
 
     fn find_type(&self, name: &str) -> Result<usize, TypeLookupError> {
-        println!("Find type: {}", name);
-        println!("{:?}", self);
         if let Some((node, type_id)) = self.unloaded_declarations.get(name) {
-            println!("Lazy: {}", name);
             return Err(TypeLookupError::Unloaded(*node));
         } else if let Some(declaration) = self.declarations.get(name) {
             return Ok(*declaration);
@@ -712,7 +820,6 @@ fn check_type<'a>(
         let name = RecordDeclaration::get_name(document, &node);
         nodes.insert(node.id(), node.clone());
         if lazy {
-            println!("Inserting unloaded decl {}", name);
             types.push(None);
             global_scope
                 .borrow_mut()
@@ -724,9 +831,15 @@ fn check_type<'a>(
                 .borrow_mut()
                 .declarations
                 .insert(name.to_string(), id);
-            if let Ok(decl) =
-                RecordDeclaration::parse(document, cursor, global_scope, types, nodes, diagnostics)
-            {
+            if let Ok(decl) = RecordDeclaration::parse(
+                document,
+                cursor,
+                global_scope,
+                types,
+                nodes,
+                diagnostics,
+                id,
+            ) {
                 let name = decl.name.clone();
                 types[id] = Some(Declaration::Record(decl));
             }
