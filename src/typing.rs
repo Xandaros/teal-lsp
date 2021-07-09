@@ -216,7 +216,7 @@ impl Scope {
             if node.kind_id() == *RECORD_DECLARATION {
                 scope.borrow_mut().unloaded_declarations.remove(&name);
                 scope.borrow_mut().declarations.insert(name.clone(), id);
-                let record = RecordDeclaration::parse(
+                RecordDeclaration::load(
                     document,
                     &mut node.walk(),
                     Rc::clone(&scope),
@@ -226,8 +226,6 @@ impl Scope {
                     id,
                 )
                 .ok()?;
-                let decl = Declaration::Record(record);
-                types[id] = Some(decl);
                 return Some(id);
             } else {
                 todo!()
@@ -316,7 +314,7 @@ impl RecordDeclaration {
         }
     }
 
-    fn parse<'a>(
+    fn load<'a>(
         document: &Document,
         cursor: &mut TreeCursor<'a>,
         scope: Rc<RefCell<Scope>>,
@@ -324,7 +322,7 @@ impl RecordDeclaration {
         nodes: &mut HashMap<usize, Node<'a>>,
         diagnostics: &mut Vec<Diagnostic>,
         id: usize,
-    ) -> Result<Self> {
+    ) -> Result<()> {
         let node = cursor.node();
         let name = Self::get_name(document, &node);
 
@@ -383,7 +381,7 @@ impl RecordDeclaration {
                                 .borrow_mut()
                                 .declarations
                                 .insert(name.to_string(), id);
-                            if let Ok(decl) = RecordDeclaration::parse(
+                            if let Ok(_) = RecordDeclaration::load(
                                 document,
                                 cursor,
                                 Rc::clone(&record_scope),
@@ -392,9 +390,7 @@ impl RecordDeclaration {
                                 diagnostics,
                                 id,
                             ) {
-                                let name = decl.name.clone();
-                                types[id] = Some(Declaration::Record(decl));
-                                members.insert(name, RecordMember::Declaration(id));
+                                members.insert(name.to_string(), RecordMember::Declaration(id));
                             }
                         }
 
@@ -476,7 +472,8 @@ impl RecordDeclaration {
             members,
             type_args,
         };
-        Ok(decl)
+        types[id] = Some(Declaration::Record(decl.clone()));
+        Ok(())
     }
 }
 
@@ -831,7 +828,7 @@ fn check_type<'a>(
                 .borrow_mut()
                 .declarations
                 .insert(name.to_string(), id);
-            if let Ok(decl) = RecordDeclaration::parse(
+            RecordDeclaration::load(
                 document,
                 cursor,
                 global_scope,
@@ -839,10 +836,7 @@ fn check_type<'a>(
                 nodes,
                 diagnostics,
                 id,
-            ) {
-                let name = decl.name.clone();
-                types[id] = Some(Declaration::Record(decl));
-            }
+            );
         }
     }
 }
