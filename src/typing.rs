@@ -1082,6 +1082,21 @@ fn check_type<'a>(
                 }
             }
 
+            if idx < variable_list.len() {
+                let last_node = signature_nodes[signature_nodes.len() - 1];
+                let range = Range {
+                    start_byte: last_node.end_byte(),
+                    end_byte: last_node.end_byte(),
+                    start_point: last_node.end_position(),
+                    end_point: last_node.end_position(),
+                };
+
+                diagnostics.push(mk_diagnostic(
+                    range,
+                    "Fewer type annotations than variables in declaration\nDeclare types for all variables or for none of them".to_string(),
+                    DiagnosticSeverity::Warning));
+            }
+
             signature_cursor.goto_parent();
         }
 
