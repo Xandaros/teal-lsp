@@ -540,8 +540,11 @@ impl Type {
         diagnostics: Option<&mut Vec<Diagnostic>>,
     ) -> &'a Type {
         use Type::*;
+        if let Basic(BasicType::Any) = actual {
+            return expected;
+        }
         match expected {
-            Basic(BasicType::Any) => return actual,
+            Basic(BasicType::Any) => return expected,
             Basic(BasicType::Number) => {
                 if let Basic(actual) = actual {
                     if *actual == BasicType::Number || *actual == BasicType::Integer {
