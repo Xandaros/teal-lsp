@@ -31,12 +31,15 @@ node_kind!(RECORD_ARRAY_TYPE, "record_array_type");
 node_kind!(FIELD, "field");
 node_kind!(SIMPLE_TYPE, "simple_type");
 node_kind!(TYPE_INDEX, "type_index");
+node_kind!(NUMBER, "number");
 node_kind!(TABLE_TYPE, "table_type");
 node_kind!(FUNCTION_TYPE, "function_type");
 node_kind!(TYPE_UNION, "type_union");
 node_kind!(ARG, "arg");
 node_kind!(VARARGS, "varargs");
 node_kind!(METAMETHOD, "metamethod");
+node_kind!(VAR_DECLARATION, "var_declaration");
+node_kind!(VAR, "var");
 field_kind!(KEY, "key");
 field_kind!(STRING_KEY, "string_key");
 field_kind!(CONTENT, "content");
@@ -44,6 +47,9 @@ field_kind!(TYPE, "type");
 field_kind!(NAME, "name");
 field_kind!(ARGUMENTS, "arguments");
 field_kind!(RETURN_TYPE, "return_type");
+field_kind!(SCOPE, "scope");
+field_kind!(DECLARATORS, "declarators");
+field_kind!(INITIALIZERS, "initializers");
 
 fn mk_diagnostic(range: Range, message: String, severity: DiagnosticSeverity) -> Diagnostic {
     let mut ret = Diagnostic::default();
@@ -148,11 +154,42 @@ enum Declaration {
 }
 
 #[derive(Debug)]
-struct Scope {
+pub(crate) struct Scope {
     declarations: HashMap<String, usize>,
     unloaded_declarations: HashMap<String, (usize, usize)>,
-    variables: HashMap<String, Type>,
+    variables: HashMap<String, Option<Type>>,
     parent: Option<Rc<RefCell<Scope>>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum DeclaredScope {
+    Local,
+    Global,
+}
+
+impl From<BasicType> for Type {
+    fn from(basic: BasicType) -> Self {
+        Self::Basic(basic)
+    }
+}
+
+impl DeclaredScope {
+    fn parse(document: &Document, node: Node, diagnostics: &mut Vec<Diagnostic>) -> Self {
+        let text = node.utf8_text(document.source.as_bytes());
+        match text {
+            Ok("local") => DeclaredScope::Local,
+            Ok("global") => DeclaredScope::Global,
+            Ok(_) => unreachable!(),
+            Err(_) => {
+                diagnostics.push(mk_diagnostic(
+                    node.range(),
+                    "UTF-8 decode failed".to_string(),
+                    DiagnosticSeverity::Error,
+                ));
+                DeclaredScope::Global
+            }
+        }
+    }
 }
 
 impl BasicType {
@@ -539,7 +576,7 @@ impl Type {
                             format!("Type not found: {}", text),
                             DiagnosticSeverity::Error,
                         ));
-                        Ok(Type::Basic(BasicType::Any))
+                        Ok(BasicType::Any.into())
                     }
                 }
             }
@@ -562,7 +599,7 @@ impl Type {
             cursor.goto_parent();
 
             match &left {
-                Type::Basic(BasicType::Any) => Ok(Type::Basic(BasicType::Any)),
+                Type::Basic(BasicType::Any) => Ok(BasicType::Any.into()),
                 Type::UserDefined(typeid) => {
                     if let Some(typ) = types[*typeid].as_ref() {
                         match typ {
@@ -586,12 +623,12 @@ impl Type {
                                         format!("{} not found in {}", right_text, left_text),
                                         DiagnosticSeverity::Error,
                                     ));
-                                    Ok(Type::Basic(BasicType::Any))
+                                    Ok(BasicType::Any.into())
                                 }
                             }
                         }
                     } else {
-                        Ok(Type::Basic(BasicType::Any))
+                        Ok(BasicType::Any.into())
                     }
                 }
                 typ => {
@@ -614,7 +651,7 @@ impl Type {
                         message,
                         DiagnosticSeverity::Error,
                     ));
-                    Ok(Type::Basic(BasicType::Any))
+                    Ok(BasicType::Any.into())
                 }
             }
         } else if node.kind_id() == *TABLE_TYPE {
@@ -732,14 +769,16 @@ impl Type {
 
             cursor.goto_parent();
             Ok(Type::Union(Box::new(left), Box::new(right)))
+        } else if node.kind_id() == *NUMBER {
+            Ok(BasicType::Number.into()) // TODO: integers
         } else {
             panic!("Unknown type node: {:?}", node);
         }
     }
 }
 
-impl<'a> Scope {
-    fn new() -> Rc<RefCell<Self>> {
+impl Scope {
+    pub(crate) fn new() -> Rc<RefCell<Self>> {
         Rc::new(RefCell::new(Self {
             declarations: HashMap::new(),
             unloaded_declarations: HashMap::new(),
@@ -748,7 +787,7 @@ impl<'a> Scope {
         }))
     }
 
-    fn find_variable(&self, name: &str) -> Option<Type> {
+    fn find_variable(&self, name: &str) -> Option<Option<Type>> {
         if let Some(typ) = self.variables.get(name) {
             return Some(typ.clone());
         }
@@ -772,17 +811,25 @@ impl<'a> Scope {
         }
     }
 
-    fn child(parent: Rc<RefCell<Self>>) -> Rc<RefCell<Scope>> {
+    pub(crate) fn child(parent: Rc<RefCell<Self>>) -> Rc<RefCell<Scope>> {
         let mut ret = Self::new();
         ret.borrow_mut().parent = Some(parent);
         ret
+    }
+
+    pub(crate) fn get_global(scope: Rc<RefCell<Self>>) -> Rc<RefCell<Self>> {
+        if let Some(ref parent) = scope.borrow().parent {
+            Scope::get_global(Rc::clone(parent))
+        } else {
+            scope.clone()
+        }
     }
 }
 
 fn check_type<'a>(
     document: &Document,
     cursor: &mut TreeCursor<'a>,
-    global_scope: Rc<RefCell<Scope>>,
+    scope: Rc<RefCell<Scope>>,
     types: &mut Vec<Option<Declaration>>,
     nodes: &mut HashMap<usize, Node<'a>>,
     diagnostics: &mut Vec<Diagnostic>,
@@ -799,7 +846,7 @@ fn check_type<'a>(
             check_type(
                 document,
                 cursor,
-                Rc::clone(&global_scope),
+                Rc::clone(&scope),
                 types,
                 nodes,
                 diagnostics,
@@ -818,25 +865,115 @@ fn check_type<'a>(
         nodes.insert(node.id(), node.clone());
         if lazy {
             types.push(None);
-            global_scope
+            scope
                 .borrow_mut()
                 .unloaded_declarations
                 .insert(name.to_string(), (node.id(), id));
         } else {
             types.push(None);
-            global_scope
-                .borrow_mut()
-                .declarations
-                .insert(name.to_string(), id);
-            RecordDeclaration::load(
-                document,
-                cursor,
-                global_scope,
-                types,
-                nodes,
-                diagnostics,
-                id,
-            );
+            scope.borrow_mut().declarations.insert(name.to_string(), id);
+            RecordDeclaration::load(document, cursor, scope, types, nodes, diagnostics, id);
+        }
+    } else if node.kind_id() == *VAR_DECLARATION {
+        let declared_scope = node
+            .child_by_field_id(*SCOPE)
+            .map_or(DeclaredScope::Global, |node| {
+                DeclaredScope::parse(document, node, diagnostics)
+            });
+
+        let declarators = node.child_by_field_id(*DECLARATORS).unwrap();
+
+        let mut variable_list = Vec::with_capacity(declarators.named_child_count());
+
+        let mut declarator_cursor = declarators.walk();
+        declarator_cursor.goto_first_child();
+        loop {
+            let node = declarator_cursor.node();
+
+            if node.kind_id() == *VAR {
+                let name = node.child_by_field_id(*NAME).unwrap();
+                let text = match name.utf8_text(document.source.as_bytes()) {
+                    Ok(text) => text,
+                    _ => {
+                        diagnostics.push(mk_diagnostic(
+                            node.range(),
+                            "UTF-8 decode failed".to_string(),
+                            DiagnosticSeverity::Error,
+                        ));
+                        "#ERROR#"
+                    }
+                };
+                scope.borrow_mut().variables.insert(text.to_string(), None);
+                variable_list.push(text);
+            }
+
+            if !declarator_cursor.goto_next_sibling() {
+                break;
+            }
+        }
+        declarator_cursor.goto_parent();
+
+        if let Some(initializers) = node.child_by_field_id(*INITIALIZERS) {
+            let mut initializer_cursor = initializers.walk();
+
+            initializer_cursor.goto_first_child();
+            let mut idx = 0;
+
+            loop {
+                if initializer_cursor.node().is_named() {
+                    let typ = Type::parse(
+                        document,
+                        &mut initializer_cursor,
+                        scope.clone(),
+                        types,
+                        nodes,
+                        diagnostics,
+                    )
+                    .unwrap_or(BasicType::Any.into()); // TODO
+
+                    if idx < variable_list.len() {
+                        let name = variable_list[idx];
+                        scope
+                            .borrow_mut()
+                            .variables
+                            .insert(name.to_string(), Some(typ));
+                    } else {
+                        let current_node = initializer_cursor.node();
+                        diagnostics.push(mk_diagnostic(
+                            Range {
+                                start_byte: current_node.start_byte(),
+                                end_byte: node.end_byte(),
+                                start_point: current_node.start_position(),
+                                end_point: node.end_position(),
+                            },
+                            "More values than variables in declaration".to_string(),
+                            DiagnosticSeverity::Warning,
+                        ));
+                        break;
+                    }
+                    idx += 1;
+                }
+
+                if !initializer_cursor.goto_next_sibling() {
+                    break;
+                }
+            }
+
+            for name in &variable_list[idx..] {
+                scope
+                    .borrow_mut()
+                    .variables
+                    .insert(name.to_string(), Some(BasicType::Nil.into()));
+            }
+
+            initializer_cursor.goto_parent();
+        } else {
+            for name in variable_list {
+                scope
+                    .borrow_mut()
+                    .variables
+                    .insert(name.to_string(), Some(BasicType::Nil.into()));
+            }
         }
     }
 }
@@ -862,5 +999,6 @@ impl Document {
             &mut nodes,
             diagnostics,
         );
+        println!("{:#?}", global_scope.borrow().variables);
     }
 }
