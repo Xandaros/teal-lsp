@@ -40,6 +40,7 @@ node_kind!(VARARGS, "varargs");
 node_kind!(METAMETHOD, "metamethod");
 node_kind!(VAR_DECLARATION, "var_declaration");
 node_kind!(VAR, "var");
+node_kind!(ERROR, "ERROR");
 field_kind!(KEY, "key");
 field_kind!(STRING_KEY, "string_key");
 field_kind!(CONTENT, "content");
@@ -50,6 +51,7 @@ field_kind!(RETURN_TYPE, "return_type");
 field_kind!(SCOPE, "scope");
 field_kind!(DECLARATORS, "declarators");
 field_kind!(INITIALIZERS, "initializers");
+field_kind!(TYPE_ANNOTATION, "type_annotation");
 
 fn mk_diagnostic(range: Range, message: String, severity: DiagnosticSeverity) -> Diagnostic {
     let mut ret = Diagnostic::default();
@@ -92,7 +94,7 @@ enum Type {
     Union(Box<Type>, Box<Type>),
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum BasicType {
     Any,
     Nil,
@@ -193,7 +195,7 @@ impl DeclaredScope {
 }
 
 impl BasicType {
-    fn to_string(&self) -> &str {
+    fn to_string(&self) -> &'static str {
         match *self {
             BasicType::Any => "any",
             BasicType::Nil => "nil",
@@ -517,7 +519,7 @@ impl RecordDeclaration {
 impl Type {
     fn to_string(&self, types: &mut Vec<Option<Declaration>>) -> Cow<str> {
         match *self {
-            Type::Basic(kind) => Cow::from("basic"),
+            Type::Basic(kind) => Cow::from(kind.to_string()),
             Type::Array(_) => Cow::from("array"),
             Type::Tuple(_) => Cow::from("tuple"),
             Type::Map(_, _) => Cow::from("map"),
@@ -528,6 +530,51 @@ impl Type {
             },
             Type::Union(_, _) => Cow::from("union"),
         }
+    }
+
+    fn unify<'a>(
+        expected: &'a Type,
+        actual: &'a Type,
+        range: Range,
+        types: &mut Vec<Option<Declaration>>,
+        diagnostics: Option<&mut Vec<Diagnostic>>,
+    ) -> &'a Type {
+        use Type::*;
+        match expected {
+            Basic(BasicType::Any) => return actual,
+            Basic(BasicType::Number) => {
+                if let Basic(actual) = actual {
+                    if *actual == BasicType::Number || *actual == BasicType::Integer {
+                        return expected;
+                    }
+                }
+            }
+            Basic(basic) => {
+                if let Basic(basic_actual) = actual {
+                    if basic == basic_actual {
+                        return actual;
+                    }
+                }
+            }
+            Array(_) => todo!(),
+            Tuple(_) => todo!(),
+            Map(_, _) => todo!(),
+            Function(_) => todo!(),
+            UserDefined(_) => todo!(),
+            Union(left, right) => {}
+        }
+        if let Some(diagnostics) = diagnostics {
+            diagnostics.push(mk_diagnostic(
+                range,
+                format!(
+                    "mismatched types\nexpected `{}`, found `{}`",
+                    expected.to_string(types),
+                    actual.to_string(types)
+                ),
+                DiagnosticSeverity::Error,
+            ));
+        }
+        expected
     }
 
     fn parse<'a>(
@@ -769,6 +816,9 @@ impl Type {
 
             cursor.goto_parent();
             Ok(Type::Union(Box::new(left), Box::new(right)))
+        } else if node.kind_id() == *ERROR {
+            // Syntax error - we're not responsible for those, so no diagnostic
+            Ok(BasicType::Any.into())
         } else {
             panic!("Unknown type node: {:?}", node);
         }
@@ -843,6 +893,40 @@ fn parse_expression(
     }
 }
 
+fn assign_variable<T: Into<String> + AsRef<str>>(
+    document: &Document,
+    scope: Rc<RefCell<Scope>>,
+    name: T,
+    typ: Type,
+    range: Range,
+    types: &mut Vec<Option<Declaration>>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let new_typ = match scope.borrow().variables.get(name.as_ref()) {
+        Some(Some(existing_type)) => {
+            // Type found and has a type
+            Type::unify(existing_type, &typ, range, types, Some(diagnostics)).clone()
+        }
+        Some(None) => {
+            // Variable still uninitialized
+            typ
+        }
+        None => {
+            // Variable not found
+            diagnostics.push(mk_diagnostic(
+                range,
+                format!("Unknown variable: {}", name.as_ref()),
+                DiagnosticSeverity::Error,
+            ));
+            return;
+        }
+    };
+    scope
+        .borrow_mut()
+        .variables
+        .insert(name.into(), Some(new_typ));
+}
+
 fn check_type<'a>(
     document: &Document,
     cursor: &mut TreeCursor<'a>,
@@ -901,7 +985,10 @@ fn check_type<'a>(
         let declarators = node.child_by_field_id(*DECLARATORS).unwrap();
 
         let mut variable_list = Vec::with_capacity(declarators.named_child_count());
-        let mut var_nodes = Vec::new();
+        let mut var_nodes = Vec::with_capacity(declarators.named_child_count());
+
+        let mut signature_list = Vec::new();
+        let mut signature_nodes = Vec::new();
 
         let mut declarator_cursor = declarators.walk();
         declarator_cursor.goto_first_child();
@@ -921,6 +1008,7 @@ fn check_type<'a>(
                         "#ERROR#"
                     }
                 };
+
                 scope.borrow_mut().variables.insert(text.to_string(), None);
                 variable_list.push(text);
                 var_nodes.push(name);
@@ -931,6 +1019,71 @@ fn check_type<'a>(
             }
         }
         declarator_cursor.goto_parent();
+
+        if let Some(signatures) = node.child_by_field_id(*TYPE_ANNOTATION) {
+            let mut signature_cursor = signatures.walk();
+            signature_list = Vec::with_capacity(signature_cursor.node().named_child_count());
+            signature_nodes = Vec::with_capacity(signature_cursor.node().named_child_count());
+
+            signature_cursor.goto_first_child();
+
+            let mut idx = 0;
+
+            loop {
+                let current_node = signature_cursor.node();
+                if current_node.is_named() {
+                    let typ = if let Ok(typ) = Type::parse(
+                        document,
+                        &mut signature_cursor,
+                        Rc::clone(&scope),
+                        types,
+                        nodes,
+                        diagnostics,
+                    ) {
+                        signature_list.push(typ.clone());
+                        typ
+                    } else {
+                        diagnostics.push(mk_diagnostic(
+                            current_node.range(),
+                            "UTF-8 decode failed".to_string(),
+                            DiagnosticSeverity::Error,
+                        ));
+                        signature_list.push(BasicType::Any.into());
+                        BasicType::Any.into()
+                    };
+                    signature_nodes.push(current_node);
+
+                    if idx < variable_list.len() {
+                        scope
+                            .borrow_mut()
+                            .variables
+                            .insert(variable_list[idx].to_string(), Some(typ));
+                    } else {
+                        while signature_cursor.goto_next_sibling() {}
+                        let last_node = signature_cursor.node();
+                        diagnostics.push(mk_diagnostic(
+                            Range {
+                                start_byte: current_node.start_byte(),
+                                end_byte: last_node.end_byte(),
+                                start_point: current_node.start_position(),
+                                end_point: last_node.end_position(),
+                            },
+                            "More type annotations than variables in declaration".to_string(),
+                            DiagnosticSeverity::Warning,
+                        ));
+                        break;
+                    }
+
+                    idx += 1;
+                }
+
+                if !signature_cursor.goto_next_sibling() {
+                    break;
+                }
+            }
+
+            signature_cursor.goto_parent();
+        }
 
         if let Some(initializers) = node.child_by_field_id(*INITIALIZERS) {
             let mut initializer_cursor = initializers.walk();
@@ -951,10 +1104,15 @@ fn check_type<'a>(
 
                     if idx < variable_list.len() {
                         let name = variable_list[idx];
-                        scope
-                            .borrow_mut()
-                            .variables
-                            .insert(name.to_string(), Some(typ));
+                        assign_variable(
+                            document,
+                            Rc::clone(&scope),
+                            name,
+                            typ,
+                            current_node.range(),
+                            types,
+                            diagnostics,
+                        );
                     } else {
                         diagnostics.push(mk_diagnostic(
                             Range {
