@@ -769,8 +769,6 @@ impl Type {
 
             cursor.goto_parent();
             Ok(Type::Union(Box::new(left), Box::new(right)))
-        } else if node.kind_id() == *NUMBER {
-            Ok(BasicType::Number.into()) // TODO: integers
         } else {
             panic!("Unknown type node: {:?}", node);
         }
@@ -823,6 +821,25 @@ impl Scope {
         } else {
             scope.clone()
         }
+    }
+}
+
+fn parse_expression(
+    document: &Document,
+    cursor: &mut TreeCursor,
+    scope: Rc<RefCell<Scope>>,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Result<Type> {
+    let node = cursor.node();
+    if node.kind_id() == *NUMBER {
+        Ok(BasicType::Number.into()) // TODO: integers
+    } else {
+        diagnostics.push(mk_diagnostic(
+            node.range(),
+            "Unknown expression kind".to_string(),
+            DiagnosticSeverity::Information,
+        ));
+        Ok(BasicType::Any.into())
     }
 }
 
@@ -884,6 +901,7 @@ fn check_type<'a>(
         let declarators = node.child_by_field_id(*DECLARATORS).unwrap();
 
         let mut variable_list = Vec::with_capacity(declarators.named_child_count());
+        let mut var_nodes = Vec::new();
 
         let mut declarator_cursor = declarators.walk();
         declarator_cursor.goto_first_child();
@@ -905,6 +923,7 @@ fn check_type<'a>(
                 };
                 scope.borrow_mut().variables.insert(text.to_string(), None);
                 variable_list.push(text);
+                var_nodes.push(name);
             }
 
             if !declarator_cursor.goto_next_sibling() {
@@ -921,12 +940,11 @@ fn check_type<'a>(
 
             loop {
                 if initializer_cursor.node().is_named() {
-                    let typ = Type::parse(
+                    let current_node = initializer_cursor.node();
+                    let typ = parse_expression(
                         document,
                         &mut initializer_cursor,
-                        scope.clone(),
-                        types,
-                        nodes,
+                        Rc::clone(&scope),
                         diagnostics,
                     )
                     .unwrap_or(BasicType::Any.into()); // TODO
@@ -938,7 +956,6 @@ fn check_type<'a>(
                             .variables
                             .insert(name.to_string(), Some(typ));
                     } else {
-                        let current_node = initializer_cursor.node();
                         diagnostics.push(mk_diagnostic(
                             Range {
                                 start_byte: current_node.start_byte(),
@@ -959,11 +976,26 @@ fn check_type<'a>(
                 }
             }
 
-            for name in &variable_list[idx..] {
-                scope
-                    .borrow_mut()
-                    .variables
-                    .insert(name.to_string(), Some(BasicType::Nil.into()));
+            if idx < variable_list.len() {
+                let start_node = var_nodes[idx];
+                let end_node = var_nodes[var_nodes.len() - 1];
+                let range = Range {
+                    start_byte: start_node.start_byte(),
+                    end_byte: end_node.end_byte(),
+                    start_point: start_node.start_position(),
+                    end_point: end_node.end_position(),
+                };
+                diagnostics.push(mk_diagnostic(
+                    range,
+                    "Not all variables initialized".to_string(),
+                    DiagnosticSeverity::Information,
+                ));
+                for name in &variable_list[idx..] {
+                    scope
+                        .borrow_mut()
+                        .variables
+                        .insert(name.to_string(), Some(BasicType::Nil.into()));
+                }
             }
 
             initializer_cursor.goto_parent();
